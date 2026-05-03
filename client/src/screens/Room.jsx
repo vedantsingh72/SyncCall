@@ -1,21 +1,40 @@
 import React, { useEffect, useCallback, useRef, useState } from "react";
 import ReactPlayer from "react-player";
-import { useLocation, useParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 import peer from "../service/peer";
 import { useSocket } from "../context/SocketProvider";
 
 const RoomPage = () => {
   const socket = useSocket();
+  const navigate = useNavigate();
   const { roomId } = useParams();
   const location = useLocation();
   const [remoteSocketId, setRemoteSocketId] = useState(null);
   const [myStream, setMyStream] = useState();
   const [remoteStream, setRemoteStream] = useState();
+  const [isMuted, setIsMuted] = useState(false);
+  const [isVideoOff, setIsVideoOff] = useState(false);
+  const [myDisplayName, setMyDisplayName] = useState("");
+  const [remoteDisplayName, setRemoteDisplayName] = useState("");
+  const [peerKey, setPeerKey] = useState(0);
   const hasJoinedRoom = useRef(false);
+  const remoteSocketIdRef = useRef(null);
+
+  useEffect(() => {
+    remoteSocketIdRef.current = remoteSocketId;
+  }, [remoteSocketId]);
 
   const handleUserJoined = useCallback(({ email, id }) => {
     console.log(`Email ${email} joined room`);
     setRemoteSocketId(id);
+    if (email) setRemoteDisplayName(email);
+  }, []);
+
+  const handleUserLeft = useCallback(({ id }) => {
+    if (remoteSocketIdRef.current !== id) return;
+    setRemoteSocketId(null);
+    setRemoteDisplayName("");
+    setRemoteStream(undefined);
   }, []);
 
   const handleCallUser = useCallback(async () => {
@@ -29,8 +48,9 @@ const RoomPage = () => {
   }, [remoteSocketId, socket]);
 
   const handleIncommingCall = useCallback(
-    async ({ from, offer }) => {
+    async ({ from, offer, email }) => {
       setRemoteSocketId(from);
+      if (email) setRemoteDisplayName(email);
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: true,
@@ -44,6 +64,7 @@ const RoomPage = () => {
   );
 
   const sendStreams = useCallback(() => {
+    if (!myStream) return;
     for (const track of myStream.getTracks()) {
       peer.peer.addTrack(track, myStream);
     }
@@ -64,11 +85,12 @@ const RoomPage = () => {
   }, [remoteSocketId, socket]);
 
   useEffect(() => {
-    peer.peer.addEventListener("negotiationneeded", handleNegoNeeded);
+    const pc = peer.peer;
+    pc.addEventListener("negotiationneeded", handleNegoNeeded);
     return () => {
-      peer.peer.removeEventListener("negotiationneeded", handleNegoNeeded);
+      pc.removeEventListener("negotiationneeded", handleNegoNeeded);
     };
-  }, [handleNegoNeeded]);
+  }, [handleNegoNeeded, peerKey]);
 
   const handleNegoNeedIncomming = useCallback(
     async ({ from, offer }) => {
@@ -82,29 +104,83 @@ const RoomPage = () => {
     await peer.setLocalDescription(ans);
   }, []);
 
-  useEffect(() => {
-    peer.peer.addEventListener("track", async (ev) => {
-      const remoteStream = ev.streams;
-      console.log("GOT TRACKS!!");
-      setRemoteStream(remoteStream[0]);
+  const toggleMute = useCallback(() => {
+    if (!myStream) return;
+    const nextMuted = !isMuted;
+    myStream.getAudioTracks().forEach((track) => {
+      track.enabled = !nextMuted;
     });
-  }, []);
+    setIsMuted(nextMuted);
+  }, [isMuted, myStream]);
+
+  const toggleVideo = useCallback(() => {
+    if (!myStream) return;
+    const nextVideoOff = !isVideoOff;
+    myStream.getVideoTracks().forEach((track) => {
+      track.enabled = !nextVideoOff;
+    });
+    setIsVideoOff(nextVideoOff);
+  }, [isVideoOff, myStream]);
+
+  const copyRoomId = useCallback(async () => {
+    if (!roomId) return;
+    try {
+      await navigator.clipboard.writeText(roomId);
+    } catch (error) {
+      console.error("Failed to copy room id", error);
+    }
+  }, [roomId]);
+
+  const endCall = useCallback(() => {
+    myStream?.getTracks().forEach((track) => track.stop());
+    setMyStream(undefined);
+    setRemoteStream(undefined);
+    setRemoteSocketId(null);
+    setRemoteDisplayName("");
+    setIsMuted(false);
+    setIsVideoOff(false);
+    peer.recreateConnection();
+    setPeerKey((k) => k + 1);
+    navigate("/");
+  }, [myStream, navigate]);
+
+  useEffect(() => {
+    const pc = peer.peer;
+    const onTrack = (ev) => {
+      const rs = ev.streams;
+      console.log("GOT TRACKS!!");
+      setRemoteStream(rs[0]);
+    };
+    pc.addEventListener("track", onTrack);
+    return () => pc.removeEventListener("track", onTrack);
+  }, [peerKey]);
+
+  useEffect(() => {
+    return () => {
+      myStream?.getTracks().forEach((track) => track.stop());
+    };
+  }, [myStream]);
 
   useEffect(() => {
     if (hasJoinedRoom.current || !roomId) return;
 
-    const email =
+    const displayName =
+      location.state?.displayName ||
       location.state?.email ||
+      window.sessionStorage.getItem("rtc-display-name") ||
       window.sessionStorage.getItem("rtc-email") ||
       `guest-${socket.id?.slice(0, 6) || "user"}`;
 
-    window.sessionStorage.setItem("rtc-email", email);
-    socket.emit("room:join", { email, room: roomId });
+    window.sessionStorage.setItem("rtc-display-name", displayName);
+    window.sessionStorage.setItem("rtc-email", displayName);
+    setMyDisplayName(displayName);
+    socket.emit("room:join", { email: displayName, room: roomId });
     hasJoinedRoom.current = true;
   }, [location.state, roomId, socket]);
 
   useEffect(() => {
     socket.on("user:joined", handleUserJoined);
+    socket.on("user:left", handleUserLeft);
     socket.on("incomming:call", handleIncommingCall);
     socket.on("call:accepted", handleCallAccepted);
     socket.on("peer:nego:needed", handleNegoNeedIncomming);
@@ -112,6 +188,7 @@ const RoomPage = () => {
 
     return () => {
       socket.off("user:joined", handleUserJoined);
+      socket.off("user:left", handleUserLeft);
       socket.off("incomming:call", handleIncommingCall);
       socket.off("call:accepted", handleCallAccepted);
       socket.off("peer:nego:needed", handleNegoNeedIncomming);
@@ -120,42 +197,130 @@ const RoomPage = () => {
   }, [
     socket,
     handleUserJoined,
+    handleUserLeft,
     handleIncommingCall,
     handleCallAccepted,
     handleNegoNeedIncomming,
     handleNegoNeedFinal,
   ]);
 
+  const remoteLabel = remoteDisplayName || "Waiting…";
+
   return (
-    <div>
-      <h1>Room Page</h1>
-      <h4>{remoteSocketId ? "Connected" : "No one in room"}</h4>
-      {myStream && <button onClick={sendStreams}>Send Stream</button>}
-      {remoteSocketId && <button onClick={handleCallUser}>CALL</button>}
-      {myStream && (
-        <>
-          <h1>My Stream</h1>
-          <ReactPlayer
-            playing
-            muted
-            height="100px"
-            width="200px"
-            url={myStream}
+    <div className="room-page">
+      <header className="room-header">
+        <div>
+          <p className="room-meta">Room</p>
+          <h1>{roomId}</h1>
+        </div>
+        <div className="room-header-actions">
+          <button type="button" className="secondary-btn" onClick={copyRoomId}>
+            Copy Room ID
+          </button>
+          <span className={`status-pill ${remoteSocketId ? "online" : ""}`}>
+            {remoteSocketId ? "Participant connected" : "Waiting for participant"}
+          </span>
+        </div>
+      </header>
+
+      <div className="participants-bar" aria-label="Participants">
+        <div className="participant-chip">
+          <span className={`participant-dot ${myDisplayName ? "live" : ""}`} aria-hidden />
+          <span className="role">You</span>
+          <strong>{myDisplayName || "—"}</strong>
+        </div>
+        <div className="participant-chip">
+          <span
+            className={`participant-dot ${remoteSocketId ? "live" : ""}`}
+            aria-hidden
           />
-        </>
-      )}
-      {remoteStream && (
-        <>
-          <h1>Remote Stream</h1>
-          <ReactPlayer
-            playing
-            muted
-            height="100px"
-            width="200px"
-            url={remoteStream}
-          />
-        </>
-      )}
+          <span className="role">Participant</span>
+          <strong>{remoteDisplayName || "Waiting…"}</strong>
+        </div>
+      </div>
+
+      <main className="video-grid">
+        <section className="video-card">
+          <div className="video-title-row">
+            <h2>{myDisplayName || "You"}</h2>
+            <span>{isMuted ? "Muted" : "Mic on"}</span>
+          </div>
+          <div className="video-stage">
+            {myStream ? (
+              <ReactPlayer
+                className="stream-player"
+                playing
+                muted
+                width="100%"
+                height="100%"
+                url={myStream}
+              />
+            ) : (
+              <div className="video-placeholder">
+                Start a call to show your camera
+              </div>
+            )}
+            <span className="video-name-badge">{myDisplayName || "You"}</span>
+          </div>
+        </section>
+
+        <section className="video-card">
+          <div className="video-title-row">
+            <h2>{remoteLabel}</h2>
+            <span>{remoteStream ? "Live" : "Not connected"}</span>
+          </div>
+          <div className="video-stage">
+            {remoteStream ? (
+              <ReactPlayer
+                className="stream-player"
+                playing
+                width="100%"
+                height="100%"
+                url={remoteStream}
+              />
+            ) : (
+              <div className="video-placeholder">
+                {remoteDisplayName
+                  ? `${remoteDisplayName}'s video will appear here`
+                  : "Remote participant video appears here"}
+              </div>
+            )}
+            <span className="video-name-badge">{remoteLabel}</span>
+          </div>
+        </section>
+      </main>
+
+      <footer className="controls-bar">
+        <button
+          type="button"
+          className="secondary-btn"
+          onClick={toggleMute}
+          disabled={!myStream}
+        >
+          {isMuted ? "Unmute" : "Mute"}
+        </button>
+        <button
+          type="button"
+          className="secondary-btn"
+          onClick={toggleVideo}
+          disabled={!myStream}
+        >
+          {isVideoOff ? "Turn Video On" : "Turn Video Off"}
+        </button>
+        {myStream && (
+          <button type="button" className="secondary-btn" onClick={sendStreams}>
+            Share Stream
+          </button>
+        )}
+        {remoteSocketId && (
+          <button type="button" className="primary-btn" onClick={handleCallUser}>
+            Start Call
+          </button>
+        )}
+        <button type="button" className="end-call-btn" onClick={endCall}>
+          End call
+        </button>
+      </footer>
     </div>
   );
 };
